@@ -1,2 +1,3 @@
-# day-to-day-analytics
-Convenience functions for day to day analytics using Pandas
+# Components
+
+Re-usable Data Science code components to make projects easy and fast
