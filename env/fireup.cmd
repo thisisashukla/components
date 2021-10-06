@@ -1,12 +1,7 @@
 @echo off
 
-set envname=%1
-set projname=%2
+set projname=%1
 
-REM ECHO %envname%
-REM ECHO %projname%
-
-call :ActivateEnv %envname%
 call :GotoProject %projname%
 
 EXIT /B %ERRORLEVEL%
