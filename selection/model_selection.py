@@ -1,168 +1,176 @@
-import gc
-import optuna
 import numpy as np
 import pandas as pd
-from functools import partial
 from sklearn.base import BaseEstimator
 from sklearn.preprocessing import MinMaxScaler
+from typing import Callable, List, Optional, Dict, Any
 
-optuna.logging.set_verbosity(optuna.logging.WARNING)
+from validations.generic import enforce_types
 
 
-class BestModelSelection(BaseEstimator):
+class MultiMetricSelection(BaseEstimator):
+    """
+    A class to compare results from two or more ML algorithms and select the best model
+    based on a given list of metrics and weights to aggregate these metrics.
+    """
+
     def __init__(
         self,
-        selection_grain,
-        metrics,
-        metric_aggregator,
-        final_metric_method,
-        model_name_indentifier,
-        metric_weights=None,
-        scale_metrics=False,
+        metrics: List[Callable[[Any, Any], float]],
+        metric_aggregator: Callable[[np.ndarray], float],
+        final_metric_method: Callable[[pd.DataFrame], float],
+        model_name_identifier: str,
+        metric_weights: Optional[List[float]] = None,
+        selection_grain: Optional[List[str]] = None,
+        scale_metrics: Optional[Callable[[np.ndarray], np.ndarray]] = None,
     ):
+        """
+        Initialize the MultiMetricSelection class.
 
-        self.selection_grain = selection_grain
+        Parameters:
+        - metrics: List of tuples where each tuple contains the metric name and its corresponding function.
+        - metric_aggregator: Function to aggregate metrics.
+        - metric_weights: Weights for each metric. Default is None.
+        - selection_grain: List of columns to group by for metric calculation.
+        - final_metric_method: Function to select the best model based on aggregated metrics.
+        - model_name_identifier: Column name that identifies the model type.
+        - scale_metrics: Callable for scaling metrics. Default is MinMaxScaler.
+        """
         self.metrics = metrics
         self.metric_aggregator = metric_aggregator
-        self.model_name_indentifier = model_name_indentifier
-        self.final_metric_method = final_metric_method
         self.metric_weights = metric_weights
+        self.selection_grain = selection_grain or []
+        self.final_metric_method = final_metric_method
+        self.model_name_identifier = model_name_identifier
         self.scale_metrics = scale_metrics
 
-    def fit(self, x, y=None):
-        def weighted_agg(agg_func, x, w):
+    def weighted_agg(
+        self, agg_func: Callable, x: np.ndarray, w: Optional[List[float]]
+    ) -> float:
+        """
+        Perform weighted aggregation of a list using a specified aggregation function.
 
-            if w is None:
-                return agg_func(x)
+        Parameters:
+        - agg_func: Aggregation function.
+        - x: List or array of values to aggregate.
+        - w: Weights for each value in x.
 
-            assert len(x) == len(w)
+        Returns:
+        - Aggregated value.
+        """
+        if w is None:
+            return agg_func(x)
 
-            return agg_func(x * w)
+        assert len(x) == len(w), "Length of weights must match length of values."
+        return agg_func(x * np.array(w))
 
-        assert all([k in x.keys() for k in ["train", "validation"]])
+    def fit(self, X: Dict[str, pd.DataFrame], y=None) -> None:
+        """
+        Fit the model to the data and select the best model.
+
+        Parameters:
+        - X: Dictionary with data splits ('train', 'validation', 'test') as keys and DataFrames as values.
+        - y: Ignored, for compatibility with sklearn.
+        """
+        assert all(
+            key in X for key in ["train", "validation"]
+        ), "Input data must have 'train' and 'validation' keys."
 
         predmetricdf = []
-        for k, df in x.items():
-            if k == "test":
+        for key, df in X.items():
+            if key == "test":
                 continue
-            combined = df
+            combined = df.copy()
             metricdf = pd.DataFrame()
-            for metric in self.metrics:
+
+            # Calculate metrics for each model
+            for metric_name, metric_func in self.metrics:
                 temp = (
                     combined.groupby(
-                        self.selection_grain + [self.model_name_indentifier],
+                        self.selection_grain + [self.model_name_identifier],
                         as_index=False,
                     )
-                    .apply(lambda x: metric[1](x["true"], x["prediction"]))
-                    .rename(columns={None: metric[0]})
+                    .apply(lambda x: metric_func(x["true"], x["prediction"]))
+                    .rename(columns={None: metric_name})
                 )
-                if metricdf.shape[0] == 0:
-                    metricdf = temp
-                else:
-                    metricdf = metricdf.merge(temp)
-            metricdf["data"] = k.split("_")[0]
-            metricdf["sample"] = "sample" in k
+                metricdf = (
+                    temp
+                    if metricdf.empty
+                    else metricdf.merge(
+                        temp, on=self.selection_grain + [self.model_name_identifier]
+                    )
+                )
+
+            metricdf["data"] = key.split("_")[0]
+            metricdf["sample"] = "sample" in key
+
             predmetricdf.append(metricdf)
 
         predmetricdf = pd.concat(predmetricdf, axis=0)
 
+        # Scale the metrics
         if self.scale_metrics:
-            scalled = []
-            metric_names = [m for m, f in self.metrics]
-            for i, grp in predmetricdf.groupby(self.selection_grain):
-                mm = MinMaxScaler()
-                grp[metric_names] = mm.fit_transform(grp[metric_names])
-                scalled.append(grp)
-
-            scalled_df = pd.concat(scalled)
+            scaled = []
+            metric_names = [m for m, _ in self.metrics]
+            for _, grp in predmetricdf.groupby(self.selection_grain):
+                scaler = self.scale_metrics()
+                grp[metric_names] = scaler.fit_transform(grp[metric_names])
+                scaled.append(grp)
+            scaled_df = pd.concat(scaled)
         else:
-            scalled_df = predmetricdf
+            scaled_df = predmetricdf
 
-        scalled_df = scalled_df.set_index(
-            self.selection_grain + [self.model_name_indentifier, "data", "sample"]
+        scaled_df = scaled_df.set_index(
+            self.selection_grain + [self.model_name_identifier, "data", "sample"]
         )
 
-        scalled_df["agg_metric"] = scalled_df.apply(
-            lambda x: weighted_agg(self.metric_aggregator, x, self.metric_weights),
+        # Aggregate metrics using weighted function
+        scaled_df["agg_metric"] = scaled_df.apply(
+            lambda x: self.weighted_agg(self.metric_aggregator, x, self.metric_weights),
             axis=1,
         )
 
-        scalled_df = scalled_df.groupby(
-            [
-                # 'ptype',
-                "model_type",
-                "data",
-                "sample",
-            ]
-        ).agg({"agg_metric": ["mean", "std", "count"]})
+        # Group by model and aggregate metric
+        scaled_df = (
+            scaled_df.groupby(self.selection_grain + ["model_type", "data", "sample"])
+            .agg({"agg_metric": ["mean", "std", "count"]})
+            .reset_index()
+        )
+        scaled_df.columns = (
+            self.selection_grain
+            + ["model_type", "data", "sample"]
+            + ["agg_metric_mean", "agg_metric_std", "agg_metric_count"]
+        )
 
-        scalled_df = scalled_df.groupby(
-            self.selection_grain + ["model_type", "data", "sample"]
-        ).agg({"agg_metric": ["mean", "std", "count"]})
+        self.predmetricdf = scaled_df
 
-        self.predmetricdf = scalled_df.reset_index()
-
+        # Select the best model based on the final metric method
         model_selection = (
             self.predmetricdf.groupby(
-                self.selection_grain + [self.model_name_indentifier]
+                self.selection_grain + [self.model_name_identifier]
             )
             .apply(self.final_metric_method)
             .reset_index()
             .rename(columns={0: "final_metric"})
         )
 
-        model_selection = model_selection.groupby(self.selection_grain).apply(
-            lambda x: x[x["final_metric"] == x["final_metric"].min()]
-        )
+        self.model_selection = model_selection.loc[
+            model_selection.groupby(self.selection_grain)["final_metric"].idxmin()
+        ][self.model_name_identifier].values[0]
 
-        self.model_selection = model_selection["model_type"].values[0]
+    def transform(self, X: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """
+        Transform the data to retain only the best model's predictions.
 
-    def transform(self, x):
+        Parameters:
+        - X: Dictionary with data splits ('train', 'validation', 'test') as keys and DataFrames as values.
 
+        Returns:
+        - DataFrame with predictions from the best model.
+        """
         best_preds = []
-        for k, df in x.items():
-            df["best_model"] = np.where(
-                df["model_type"] == self.model_selection, True, False
-            )
-            df["data_type"] = k
+        for key, df in X.items():
+            df["best_model"] = df[self.model_name_identifier] == self.model_selection
+            df["data_type"] = key
             best_preds.append(df)
 
         return pd.concat(best_preds)
-
-
-class TuneModels:
-    def __init__(self, ntrial, njobs, **kwargs):
-
-        self.ntrial = ntrial
-        self.njobs = njobs
-        if "log_func" in kwargs.keys():
-            self.log_func = kwargs["log_func"]
-        else:
-            self.log_func = print
-        self.kwargs = kwargs
-
-    def tune_model(self, objective_func, direction="minimize"):
-
-        study = optuna.create_study(direction=direction)
-        objective = partial(objective_func, **self.kwargs)
-        study.optimize(
-            objective,
-            n_trials=self.ntrial,
-            timeout=600,
-            n_jobs=self.njobs,
-            callbacks=[lambda study, trial: gc.collect()],
-        )
-
-        best_trial = study.best_trial
-
-        best_trial_results = {
-            "best_metric_value": best_trial.value,
-            "best_params": best_trial.params,
-            "tuning_grain": dict(
-                zip(self.kwargs["ts_columns"], self.kwargs["ts_values"])
-            ),
-        }
-        for k, v in best_trial.user_attrs.items():
-            best_trial_results[k] = v
-
-        return best_trial_results
